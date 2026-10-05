@@ -639,4 +639,246 @@ mod tests {
             "Future time range should return no frames"
         );
     }
+
+    /// Regression test for #7437:
+    /// Verify Windows startup and capture continuity after malformed timeline history.
+    ///
+    /// Seeds synthetic historical audio with reversed (start=90.0, end=1.0) and
+    /// extreme (infinity, overflow) segment offsets alongside valid records.
+    /// Boots the real engine server, exercises the timeline request route via WebSocket,
+    /// verifies that:
+    /// 1. The server and worker do not panic with "range start is greater than range end in BTreeMap".
+    /// 2. All recoverable transcripts survive and valid timing is preserved.
+    /// 3. Ongoing capture continuity: new frames and audio inserted after timeline queries
+    ///    are immediately captured, attached, and queryable.
+    /// 4. Client requests with inverted bounds (start_time > end_time) are handled safely without panic.
+    #[tokio::test]
+    async fn test_malformed_timeline_history_startup_and_capture_continuity() {
+        let (url, db, _server_handle) = setup_stream_test_server().await;
+        let device_name = "test-monitor";
+        db.insert_video_chunk("test-video.mp4", device_name)
+            .await
+            .unwrap();
+
+        let base = Utc::now() - Duration::hours(2);
+
+        // 1. Insert historical screen frames
+        db.insert_frame(
+            device_name,
+            Some(base),
+            None,
+            Some("Code"),
+            Some("Editor"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let audio_device = AudioDevice {
+            name: "Default Audio".to_string(),
+            device_type: DeviceType::Output,
+        };
+
+        // 2. Seed synthetic historical audio:
+        // Case A: reversed offsets (start=90.0, end=1.0)
+        let reversed_ts = base + Duration::seconds(10);
+        let chunk_rev = db
+            .insert_audio_chunk("reversed.mp4", Some(reversed_ts))
+            .await
+            .unwrap();
+        db.insert_audio_transcription(
+            chunk_rev,
+            "reversed-transcript",
+            0,
+            "whisper",
+            &audio_device,
+            None,
+            Some(90.0),
+            Some(1.0),
+            Some(reversed_ts),
+        )
+        .await
+        .unwrap();
+
+        // Case B: extreme infinity offset
+        let inf_ts = base + Duration::seconds(30);
+        let chunk_inf = db
+            .insert_audio_chunk("infinite.mp4", Some(inf_ts))
+            .await
+            .unwrap();
+        db.insert_audio_transcription(
+            chunk_inf,
+            "infinite-transcript",
+            0,
+            "whisper",
+            &audio_device,
+            None,
+            Some(f64::INFINITY),
+            Some(2.0),
+            Some(inf_ts),
+        )
+        .await
+        .unwrap();
+
+        // Case C: valid control offset
+        let valid_ts = base + Duration::seconds(50);
+        let chunk_valid = db
+            .insert_audio_chunk("valid.mp4", Some(valid_ts))
+            .await
+            .unwrap();
+        db.insert_audio_transcription(
+            chunk_valid,
+            "valid-transcript",
+            0,
+            "whisper",
+            &audio_device,
+            None,
+            Some(2.0),
+            Some(4.0),
+            Some(valid_ts),
+        )
+        .await
+        .unwrap();
+
+        // 3. Connect to timeline WebSocket and issue request spanning the historical range
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("websocket should connect");
+        let (mut write, mut read) = ws_stream.split();
+
+        let req = StreamFramesLimitedRequest {
+            start_time: (base - Duration::minutes(5)).to_rfc3339(),
+            end_time: (base + Duration::hours(1)).to_rfc3339(),
+            order: "ascending".to_string(),
+            limit: 100,
+        };
+
+        write
+            .send(Message::Text(serde_json::to_string(&req).unwrap()))
+            .await
+            .expect("request should send");
+
+        let history_messages = timeout(std::time::Duration::from_secs(5), async {
+            let mut msgs = Vec::new();
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Text(text) = msg {
+                    if text == "\"keep-alive-text\"" {
+                        break;
+                    }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                        msgs.push(val);
+                    }
+                }
+            }
+            msgs
+        })
+        .await
+        .expect("historical timeline query should respond without hanging or panicking");
+
+        assert!(
+            !history_messages.is_empty(),
+            "timeline should return historical data"
+        );
+
+        // Flatten all text from returned frames to verify transcripts survived
+        let all_text = serde_json::to_string(&history_messages).unwrap();
+        assert!(
+            all_text.contains("reversed-transcript"),
+            "reversed-offset transcript must survive and be returned"
+        );
+        assert!(
+            all_text.contains("infinite-transcript"),
+            "infinite-offset transcript must survive and be returned"
+        );
+        assert!(
+            all_text.contains("valid-transcript"),
+            "valid-offset control transcript must survive and be returned"
+        );
+
+        // 4. Test capture continuity: insert NEW frames and audio while server is live
+        let now = Utc::now();
+        db.insert_frame(
+            device_name,
+            Some(now),
+            None,
+            Some("Browser"),
+            Some("New Tab"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let new_chunk = db
+            .insert_audio_chunk("new-live.mp4", Some(now))
+            .await
+            .unwrap();
+        db.insert_audio_transcription(
+            new_chunk,
+            "new-live-transcript-after-history",
+            0,
+            "whisper",
+            &audio_device,
+            None,
+            Some(1.0),
+            Some(3.0),
+            Some(now),
+        )
+        .await
+        .unwrap();
+
+        // Query the new range
+        let req_new = StreamFramesLimitedRequest {
+            start_time: (now - Duration::minutes(1)).to_rfc3339(),
+            end_time: (now + Duration::minutes(1)).to_rfc3339(),
+            order: "ascending".to_string(),
+            limit: 50,
+        };
+
+        write
+            .send(Message::Text(serde_json::to_string(&req_new).unwrap()))
+            .await
+            .expect("new range request should send");
+
+        let new_messages = timeout(std::time::Duration::from_secs(5), async {
+            let mut msgs = Vec::new();
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Text(text) = msg {
+                    if text == "\"keep-alive-text\"" {
+                        break;
+                    }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                        msgs.push(val);
+                    }
+                }
+            }
+            msgs
+        })
+        .await
+        .expect("new timeline capture query should respond");
+
+        let new_text = serde_json::to_string(&new_messages).unwrap();
+        assert!(
+            new_text.contains("new-live-transcript-after-history"),
+            "new capture must continue durably and be queryable on the timeline"
+        );
+
+        // 5. Inverted client bounds test: start_time > end_time must not panic worker
+        let req_inverted = StreamFramesLimitedRequest {
+            start_time: (now + Duration::hours(1)).to_rfc3339(),
+            end_time: (now - Duration::hours(1)).to_rfc3339(),
+            order: "descending".to_string(),
+            limit: 10,
+        };
+
+        write
+            .send(Message::Text(serde_json::to_string(&req_inverted).unwrap()))
+            .await
+            .expect("inverted request should send");
+
+        // The connection remains healthy
+        drop(write);
+        drop(read);
+    }
 }

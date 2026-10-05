@@ -48,6 +48,9 @@ pub(crate) async fn seed_database(db: &DatabaseManager) {
     if seed_requested("search-fixture") {
         seed_search_fixture(db).await;
     }
+    if seed_requested("malformed-timeline-history") {
+        seed_malformed_timeline_history(db).await;
+    }
 }
 
 /// Apply deterministic settings mutations requested by `SCREENPIPE_E2E_SEED`.
@@ -511,6 +514,117 @@ async fn seed_search_fixture(db: &DatabaseManager) {
          (vector x12 + highlight + visibility x5 + real ocr + unstored ocr \
           + missing thumbnail + meeting replay x4)"
     );
+}
+
+/// Seed synthetic historical audio with reversed, extreme, and valid segment
+/// offsets to verify Windows startup and capture continuity under malformed
+/// timeline history (#7437).
+async fn seed_malformed_timeline_history(db: &DatabaseManager) {
+    let now = Utc::now();
+    let base = now - Duration::hours(1);
+    let device_name = "e2e-timeline-monitor";
+
+    let _ = db
+        .insert_video_chunk("e2e-malformed-video.mp4", device_name)
+        .await;
+    let _ = db
+        .insert_frame(
+            device_name,
+            Some(base),
+            None,
+            Some("Code"),
+            Some("Editor"),
+            false,
+            None,
+        )
+        .await;
+
+    let device = screenpipe_db::AudioDevice {
+        name: "e2e-audio-device".to_string(),
+        device_type: screenpipe_db::DeviceType::Output,
+    };
+
+    // 1. Reversed offsets: start=90.0, end=1.0
+    let rev_ts = base + Duration::seconds(10);
+    if let Ok(chunk_rev) = db
+        .insert_audio_chunk("e2e-reversed.mp4", Some(rev_ts))
+        .await
+    {
+        let _ = db
+            .insert_audio_transcription(
+                chunk_rev,
+                "e2e-reversed-offset-transcript",
+                0,
+                "e2e",
+                &device,
+                None,
+                Some(90.0),
+                Some(1.0),
+                Some(rev_ts),
+            )
+            .await;
+    }
+
+    // 2. Extreme infinity offset: start=f64::INFINITY, end=2.0
+    let inf_ts = base + Duration::seconds(30);
+    if let Ok(chunk_inf) = db
+        .insert_audio_chunk("e2e-infinite.mp4", Some(inf_ts))
+        .await
+    {
+        let _ = db
+            .insert_audio_transcription(
+                chunk_inf,
+                "e2e-infinite-offset-transcript",
+                0,
+                "e2e",
+                &device,
+                None,
+                Some(f64::INFINITY),
+                Some(2.0),
+                Some(inf_ts),
+            )
+            .await;
+    }
+
+    // 3. Extreme overflow offset: start=1.0e30, end=1.0e30
+    let over_ts = base + Duration::seconds(45);
+    if let Ok(chunk_over) = db
+        .insert_audio_chunk("e2e-overflow.mp4", Some(over_ts))
+        .await
+    {
+        let _ = db
+            .insert_audio_transcription(
+                chunk_over,
+                "e2e-overflow-offset-transcript",
+                0,
+                "e2e",
+                &device,
+                None,
+                Some(1.0e30),
+                Some(1.0e30),
+                Some(over_ts),
+            )
+            .await;
+    }
+
+    // 4. Valid control record: start=2.0, end=4.0
+    let val_ts = base + Duration::seconds(60);
+    if let Ok(chunk_val) = db.insert_audio_chunk("e2e-valid.mp4", Some(val_ts)).await {
+        let _ = db
+            .insert_audio_transcription(
+                chunk_val,
+                "e2e-valid-offset-transcript",
+                0,
+                "e2e",
+                &device,
+                None,
+                Some(2.0),
+                Some(4.0),
+                Some(val_ts),
+            )
+            .await;
+    }
+    info!("E2E seed: malformed timeline history seeded (reversed, extreme, and valid offsets)");
 }
 
 fn seed_requested(flag: &str) -> bool {

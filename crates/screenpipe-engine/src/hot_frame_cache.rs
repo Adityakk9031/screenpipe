@@ -176,6 +176,9 @@ impl HotFrameCache {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Vec<TimeSeriesFrame> {
+        if start > end {
+            return Vec::new();
+        }
         let frames = self.frames.read().await;
         let audio = self.audio.read().await;
 
@@ -352,6 +355,9 @@ impl HotFrameCache {
     /// files we just removed (which is what made the timeline "jump
     /// backward" right after the user clicked delete-last-15-min).
     pub async fn evict_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) {
+        if start > end {
+            return;
+        }
         {
             let mut frames = self.frames.write().await;
             frames.retain(|(ts, _), _| *ts < start || *ts > end);
@@ -410,8 +416,16 @@ fn find_audio_for_frame(
     frame_ts: DateTime<Utc>,
 ) -> Vec<AudioEntry> {
     let pad = chrono::Duration::seconds(60);
-    let search_start = frame_ts - pad;
-    let search_end = frame_ts + pad;
+    let search_start = frame_ts
+        .checked_sub_signed(pad)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let search_end = frame_ts
+        .checked_add_signed(pad)
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+
+    if search_start > search_end {
+        return Vec::new();
+    }
 
     let mut entries = Vec::new();
     for (_, audio_list) in audio_map.range(search_start..=search_end) {
@@ -585,5 +599,49 @@ mod tests {
 
         let yesterday = Utc::now() - chrono::Duration::days(1);
         assert!(!cache.is_today(yesterday).await);
+    }
+
+    #[tokio::test]
+    async fn test_inverted_range_bounds_do_not_panic() {
+        let cache = HotFrameCache::new();
+        let now = Utc::now();
+        let start = now + chrono::Duration::hours(1);
+        let end = now - chrono::Duration::hours(1);
+
+        // start > end: must not panic with "range start is greater than range end in BTreeMap"
+        let result = cache.get_frames_in_range(start, end).await;
+        assert!(result.is_empty());
+
+        // evict_range with inverted bounds must safely no-op
+        cache.evict_range(start, end).await;
+    }
+
+    #[tokio::test]
+    async fn test_extreme_timestamp_find_audio_does_not_panic() {
+        let mut audio_map = BTreeMap::new();
+        let now = Utc::now();
+        audio_map.insert(
+            now,
+            vec![HotAudio {
+                audio_chunk_id: 1,
+                timestamp: now,
+                transcription: "test".into(),
+                device_name: "test".into(),
+                is_input: false,
+                audio_file_path: "test.mp4".into(),
+                duration_secs: 5.0,
+                start_time: Some(0.0),
+                end_time: Some(5.0),
+                speaker_id: None,
+                speaker_name: None,
+            }],
+        );
+
+        // Max and min timestamps must not cause underflow/overflow panic in search_start..=search_end
+        let entries_max = find_audio_for_frame(&audio_map, DateTime::<Utc>::MAX_UTC);
+        assert!(entries_max.is_empty());
+
+        let entries_min = find_audio_for_frame(&audio_map, DateTime::<Utc>::MIN_UTC);
+        assert!(entries_min.is_empty());
     }
 }
