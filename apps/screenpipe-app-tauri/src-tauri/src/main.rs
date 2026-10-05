@@ -2329,6 +2329,7 @@ async fn main() {
             activity_history::start(app_handle.clone());
             first_run_summary::start(app_handle.clone());
             notifications::workflow::start(app_handle.clone());
+            crate::recording::start_meeting_capture_listener(app_handle.clone());
 
             // Background ChatGPT OAuth token refresh — keeps access tokens
             // fresh so the lazy path in get_valid_token() rarely needs to

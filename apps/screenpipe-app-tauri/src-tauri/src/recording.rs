@@ -890,6 +890,28 @@ async fn start_capture_inner(
     Ok(())
 }
 
+/// Listen for `meeting_started` events and start capture if capture is currently stopped.
+pub fn start_meeting_capture_listener(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use futures::StreamExt;
+        let mut sub =
+            screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+        while let Some(_event) = sub.next().await {
+            let state: tauri::State<'_, RecordingState> = app.state();
+            let is_capturing = {
+                let guard = state.capture.lock().await;
+                guard.is_some()
+            };
+            if !is_capturing {
+                info!("meeting started while capture session is stopped; starting capture");
+                if let Err(e) = start_capture(state, app.clone()).await {
+                    warn!("failed to auto-start capture session on meeting start: {e}");
+                }
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Full lifecycle commands (backward compat)
 // ---------------------------------------------------------------------------

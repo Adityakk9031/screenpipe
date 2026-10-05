@@ -1102,6 +1102,25 @@ pub(crate) async fn start_meeting_handler(
         }));
     }
 
+    if !state.audio_disabled
+        && !state.audio_manager.is_disabled().await
+        && state.audio_manager.status().await
+            != screenpipe_audio::audio_manager::AudioManagerStatus::Running
+    {
+        if let Err(e) = state.audio_manager.start().await {
+            tracing::error!(
+                "failed to start audio manager on manual meeting start: {}",
+                e
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({
+                    "error": format!("failed to start audio capture: {e}")
+                })),
+            ));
+        }
+    }
+
     if let Ok(status) = resolve_meeting_status(&state).await {
         emit_meeting_status_changed(&status);
     }

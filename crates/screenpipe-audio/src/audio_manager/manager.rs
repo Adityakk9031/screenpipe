@@ -843,6 +843,9 @@ impl AudioManager {
             .insert(device_name.to_string());
 
         let device = parse_audio_device(device_name)?;
+        if self.session_devices().contains(&device.to_string()) {
+            let _ = self.stop_session_device(&device).await;
+        }
         self.stop_device_recording(&device).await?;
         info!("user paused audio device: {}", device_name);
         Ok(())
@@ -876,7 +879,15 @@ impl AudioManager {
             .write()
             .await
             .insert(device.to_string());
-        self.start_device(&device).await?;
+        self.unsuspend_device(&device.to_string());
+
+        if self.meeting_piggyback_owns_normal_capture().await
+            && device.device_type == crate::core::device::DeviceType::Input
+        {
+            self.start_session_device(&device, None).await?;
+        } else {
+            self.start_device(&device).await?;
+        }
         if !self.is_device_actively_streaming(&device) {
             return Err(anyhow!(
                 "Device {} did not start: capture is gated or the stream is unavailable",
@@ -3890,5 +3901,30 @@ mod tests {
             !is_drm_blocked,
             "after DRM clears, device should not be blocked"
         );
+    }
+
+    #[test]
+    fn test_meeting_piggyback_owns_normal_capture_requires_all_three_conditions() {
+        assert!(!meeting_piggyback_owns_normal_capture(
+            false,
+            Some(true),
+            true
+        ));
+        assert!(!meeting_piggyback_owns_normal_capture(
+            true,
+            Some(false),
+            true
+        ));
+        assert!(!meeting_piggyback_owns_normal_capture(true, None, true));
+        assert!(!meeting_piggyback_owns_normal_capture(
+            true,
+            Some(true),
+            false
+        ));
+        assert!(meeting_piggyback_owns_normal_capture(
+            true,
+            Some(true),
+            true
+        ));
     }
 }
